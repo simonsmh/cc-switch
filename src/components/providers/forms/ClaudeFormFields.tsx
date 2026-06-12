@@ -402,12 +402,7 @@ export function ClaudeFormFields({
           setKiroModelsLoading(false);
         }
       });
-  }, [
-    isKiroAuthenticated,
-    selectedKiroAccountId,
-    showModelFetchResult,
-    t,
-  ]);
+  }, [isKiroAuthenticated, selectedKiroAccountId, showModelFetchResult, t]);
 
   useEffect(() => {
     copilotModelsRequestRef.current += 1;
