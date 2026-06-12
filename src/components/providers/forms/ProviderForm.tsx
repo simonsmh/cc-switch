@@ -1215,7 +1215,12 @@ function ProviderFormFull({
             }),
           );
         }
-        if (!isCopilotProvider && !isCodexOauthProvider && !isKiroProvider && !apiKey.trim()) {
+        if (
+          !isCopilotProvider &&
+          !isCodexOauthProvider &&
+          !isKiroProvider &&
+          !apiKey.trim()
+        ) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
