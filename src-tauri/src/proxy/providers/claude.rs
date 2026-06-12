@@ -87,7 +87,7 @@ pub fn get_claude_api_format(provider: &Provider) -> &'static str {
 pub fn claude_api_format_needs_transform(api_format: &str) -> bool {
     matches!(
         api_format,
-        "openai_chat" | "openai_responses" | "gemini_native"
+        "openai_chat" | "openai_responses" | "gemini_native" | "kiro"
     )
 }
 
@@ -475,6 +475,11 @@ impl ClaudeAdapter {
             return ProviderType::GitHubCopilot;
         }
 
+        // 检测 Kiro (AWS CodeWhisperer/Q)
+        if self.is_kiro(provider) {
+            return ProviderType::Kiro;
+        }
+
         // 检测 OpenRouter
         if self.is_openrouter(provider) {
             return ProviderType::OpenRouter;
@@ -495,6 +500,25 @@ impl ClaudeAdapter {
                 return true;
             }
         }
+        false
+    }
+
+    /// 检测是否为 Kiro (AWS CodeWhisperer/Q) 供应商
+    fn is_kiro(&self, provider: &Provider) -> bool {
+        // 方式1: 检查 meta.provider_type
+        if let Some(meta) = provider.meta.as_ref() {
+            if meta.provider_type.as_deref() == Some("kiro") {
+                return true;
+            }
+        }
+
+        // 方式2: 检查 base_url（兼容旧数据的 fallback）
+        if let Ok(base_url) = self.extract_base_url(provider) {
+            if base_url.contains("kiro.dev") {
+                return true;
+            }
+        }
+
         false
     }
 
@@ -941,13 +965,19 @@ impl ProviderAdapter for ClaudeAdapter {
             return true;
         }
 
+        // Kiro (AWS CodeWhisperer) 总是需要格式转换 (Anthropic ↔ Kiro AWS-JSON eventstream)
+        if self.is_kiro(provider) {
+            return true;
+        }
+
         // 根据 api_format 配置决定是否需要格式转换
         // - "anthropic" (默认): 直接透传，无需转换
         // - "openai_chat": 需要 Anthropic ↔ OpenAI Chat Completions 格式转换
         // - "openai_responses": 需要 Anthropic ↔ OpenAI Responses API 格式转换
+        // - "kiro": 需要 Anthropic ↔ Kiro 格式转换
         matches!(
             self.get_api_format(provider),
-            "openai_chat" | "openai_responses" | "gemini_native"
+            "openai_chat" | "openai_responses" | "gemini_native" | "kiro"
         )
     }
 
@@ -1182,6 +1212,37 @@ mod tests {
         let auth = adapter.extract_auth(&provider).unwrap();
         assert_eq!(auth.api_key, "gemini-test-key");
         assert_eq!(auth.strategy, AuthStrategy::Google);
+    }
+
+    #[test]
+    fn test_extract_auth_kiro_returns_kiro_strategy() {
+        let adapter = ClaudeAdapter::new();
+        // meta.provider_type == "kiro"
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://runtime.us-east-1.kiro.dev"
+                }
+            }),
+            ProviderMeta {
+                provider_type: Some("kiro".to_string()),
+                api_format: Some("kiro".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(adapter.provider_type(&provider), ProviderType::Kiro);
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.strategy, AuthStrategy::Kiro);
+
+        // fallback: base_url 包含 kiro.dev 但无 provider_type
+        let provider2 = create_provider(json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://runtime.eu-central-1.kiro.dev" }
+        }));
+        assert_eq!(adapter.provider_type(&provider2), ProviderType::Kiro);
+        assert_eq!(
+            adapter.extract_auth(&provider2).unwrap().strategy,
+            AuthStrategy::Kiro
+        );
     }
 
     #[test]
@@ -1436,6 +1497,13 @@ mod tests {
 
     #[test]
     fn test_needs_transform() {
+        // kiro 格式必须走转换（否则原始 Anthropic 请求会被 Kiro runtime 拒绝）
+        assert!(claude_api_format_needs_transform("kiro"));
+        assert!(claude_api_format_needs_transform("openai_chat"));
+        assert!(claude_api_format_needs_transform("openai_responses"));
+        assert!(claude_api_format_needs_transform("gemini_native"));
+        assert!(!claude_api_format_needs_transform("anthropic"));
+
         let adapter = ClaudeAdapter::new();
 
         // Default: no transform (anthropic format) - no meta
@@ -1459,6 +1527,19 @@ mod tests {
             },
         );
         assert!(!adapter.needs_transform(&explicit_anthropic));
+
+        // Kiro provider: 需要转换（通过 is_kiro 和 api_format="kiro" 两条路径）
+        let kiro_provider = create_provider_with_meta(
+            json!({
+                "env": { "ANTHROPIC_BASE_URL": "https://runtime.us-east-1.kiro.dev" }
+            }),
+            ProviderMeta {
+                provider_type: Some("kiro".to_string()),
+                api_format: Some("kiro".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(adapter.needs_transform(&kiro_provider));
 
         // Legacy settings_config.api_format: openai_chat should enable transform
         let legacy_settings_api_format = create_provider(json!({
@@ -1653,6 +1734,7 @@ mod tests {
             "openai_responses",
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1675,7 +1757,7 @@ mod tests {
             "stream": true
         });
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
         assert_eq!(transformed["stream"], true);
         assert_eq!(transformed["stream_options"]["include_usage"], true);
@@ -1693,7 +1775,7 @@ mod tests {
             "max_tokens": 128
         });
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
         assert!(transformed.get("stream_options").is_none());
     }
@@ -1723,6 +1805,7 @@ mod tests {
             &provider,
             "openai_responses",
             Some("session-123"),
+            None,
             None,
         )
         .unwrap();
@@ -1756,6 +1839,7 @@ mod tests {
             "openai_responses",
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1787,6 +1871,7 @@ mod tests {
             "openai_responses",
             Some("claude-session-123"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1816,6 +1901,7 @@ mod tests {
             body,
             &provider,
             "openai_responses",
+            None,
             None,
             None,
         )
@@ -1851,6 +1937,7 @@ mod tests {
             "openai_responses",
             Some("session-123"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1881,6 +1968,7 @@ mod tests {
             body,
             &provider,
             "openai_responses",
+            None,
             None,
             None,
         )
@@ -1916,7 +2004,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "gemini_native", None, None)
+            transform_claude_request_for_api_format(body, &provider, "gemini_native", None, None, None)
                 .unwrap();
 
         assert!(transformed.get("contents").is_some());
@@ -1949,7 +2037,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
 
         assert!(transformed.get("prompt_cache_key").is_none());
@@ -1977,7 +2065,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
 
         assert_eq!(transformed["prompt_cache_key"], "claude-cache-route");
@@ -2010,7 +2098,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
 
         let msg = &transformed["messages"][0];
@@ -2045,7 +2133,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
 
         let msg = &transformed["messages"][0];
@@ -2080,7 +2168,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
 
         let msg = &transformed["messages"][0];
@@ -2115,7 +2203,7 @@ mod tests {
         });
 
         let transformed =
-            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None, None)
                 .unwrap();
 
         let msg = &transformed["messages"][0];
