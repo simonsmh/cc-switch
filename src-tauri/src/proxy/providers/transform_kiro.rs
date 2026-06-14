@@ -392,10 +392,7 @@ pub fn anthropic_to_kiro(
                                     arm_content.push_str(t);
                                 }
                             } else if block_type == "thinking" {
-                                if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
-                                    arm_content =
-                                        format!("<thinking>{}</thinking>\n\n{}", t, arm_content);
-                                }
+                                // 丢弃 thinking 块以防止消耗 Credit，不拼入文本正文
                             } else if block_type == "tool_use" {
                                 let name = block
                                     .get("name")
