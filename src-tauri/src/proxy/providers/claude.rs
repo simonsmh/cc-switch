@@ -934,8 +934,8 @@ impl ProviderAdapter for ClaudeAdapter {
             }
             AuthStrategy::Kiro => {
                 let bearer = format!("Bearer {}", auth.api_key);
-                let mid = uuid::Uuid::new_v4().to_string().replace("-", "");
-                let ua = format!("aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{mid}");
+                let ua = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/macos lang/rust/1.92.0 md/appVersion-2.7.0 app/AmazonQ-For-CLI";
+                let amz_ua = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI";
                 // API key (ksk_) 需额外的 tokentype 头，否则运行面拒绝 Invalid token
                 let is_api_key = super::kiro_auth::is_api_key(&auth.api_key);
                 let mut headers = vec![
@@ -970,8 +970,8 @@ impl ProviderAdapter for ClaudeAdapter {
                         HeaderName::from_static("x-amzn-kiro-agent-mode"),
                         HeaderValue::from_static("vibe"),
                     ),
-                    (HeaderName::from_static("x-amz-user-agent"), hv(&ua)?),
-                    (HeaderName::from_static("user-agent"), hv(&ua)?),
+                    (HeaderName::from_static("x-amz-user-agent"), hv(amz_ua)?),
+                    (HeaderName::from_static("user-agent"), hv(ua)?),
                 ];
                 if is_api_key {
                     headers.push((

@@ -16,6 +16,86 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::copilot_auth::{GitHubAccount, GitHubDeviceCodeResponse};
 
+/// User-Agent 组件，对齐官方 kiro-cli 2.7.0 的真实流量。
+///
+/// kiro-cli 由 AWS Rust SDK 构造两个相关头：
+/// - `user-agent`：携带 `md/appVersion-<KIRO_VERSION>`
+/// - `x-amz-user-agent`：携带 metrics 段 `m/<...>`
+///
+/// 二者共享 `aws-sdk-rust/<SDK> ua/2.1 api/<service>/<API> os/macos
+/// lang/rust/<RUST> ... app/AmazonQ-For-CLI` 骨架。`api/<service>` 段按端点不同：
+/// - codewhispererstreaming → GenerateAssistantResponse, InvokeMCP
+/// - codewhispererruntime → ListAvailableModels / GetProfile / ListAvailableProfiles
+/// - ssooidc → RegisterClient / token（登录 + 刷新）
+///
+/// 取值来自真实 kiro-cli 2.7.0 抓包。
+const KIRO_SDK_VERSION: &str = "1.3.15";
+const KIRO_OIDC_SDK_VERSION: &str = "1.3.10";
+const KIRO_API_VERSION: &str = "0.1.16551";
+const KIRO_OIDC_API_VERSION: &str = "1.92.0";
+const KIRO_RUST_VERSION: &str = "1.92.0";
+const KIRO_OS: &str = "macos";
+const KIRO_VERSION: &str = "2.7.0";
+const KIRO_APP: &str = "AmazonQ-For-CLI";
+
+/// Kiro desktop 认证服务（auth.desktop.kiro.dev）不是 AWS SDK 端点 ——
+/// 官方 kiro-cli 向它发送纯 `Kiro-CLI` User-Agent。
+const KIRO_DESKTOP_USER_AGENT: &str = "Kiro-CLI";
+
+const KIRO_CLIENT_NAME: &str = "Kiro CLI";
+
+/// Kiro/AWS 服务端点族，用于选择 SDK 版本与 `api/<service>` 段。
+#[derive(Clone, Copy)]
+enum KiroSdkApi {
+    #[allow(dead_code)]
+    CodewhispererStreaming,
+    CodewhispererRuntime,
+    Ssooidc,
+}
+
+impl KiroSdkApi {
+    fn name(self) -> &'static str {
+        match self {
+            KiroSdkApi::CodewhispererStreaming => "codewhispererstreaming",
+            KiroSdkApi::CodewhispererRuntime => "codewhispererruntime",
+            KiroSdkApi::Ssooidc => "ssooidc",
+        }
+    }
+}
+
+/// 为指定的 Kiro/AWS 服务端点构造 `(user-agent, x-amz-user-agent)` 头对，
+/// 对齐官方 kiro-cli 流量。
+///
+/// `metrics` 是仅进入 `x-amz-user-agent` 的 `m/...` 段（如 streaming 用 "F"，
+/// ListAvailableModels/GetProfile 用 "F,C"，OIDC 用 "E"）。
+///
+/// 注意：OIDC 端点特殊 —— 其 `user-agent` 为裸的
+/// `aws-sdk-rust/<sdk> os/macos lang/rust/<rust>` 形式（无 `ua/`、`api/`、
+/// `md/`、`app/` 段），仅 `x-amz-user-agent` 携带完整形式；codewhisperer
+/// 端点则两头均为完整形式。
+fn kiro_user_agent(api: KiroSdkApi, metrics: &str) -> (String, String) {
+    let sdk = match api {
+        KiroSdkApi::Ssooidc => KIRO_OIDC_SDK_VERSION,
+        _ => KIRO_SDK_VERSION,
+    };
+    let api_ver = match api {
+        KiroSdkApi::Ssooidc => KIRO_OIDC_API_VERSION,
+        _ => KIRO_API_VERSION,
+    };
+    let base = format!(
+        "aws-sdk-rust/{sdk} ua/2.1 api/{}/{api_ver} os/{KIRO_OS} lang/rust/{KIRO_RUST_VERSION}",
+        api.name()
+    );
+    let user_agent = match api {
+        KiroSdkApi::Ssooidc => {
+            format!("aws-sdk-rust/{sdk} os/{KIRO_OS} lang/rust/{KIRO_RUST_VERSION}")
+        }
+        _ => format!("{base} md/appVersion-{KIRO_VERSION} app/{KIRO_APP}"),
+    };
+    let x_amz_user_agent = format!("{base} m/{metrics} app/{KIRO_APP}");
+    (user_agent, x_amz_user_agent)
+}
+
 /// Kiro OIDC 范围
 const SSO_SCOPES: &[&str] = &[
     "codewhisperer:completions",
@@ -790,7 +870,7 @@ impl KiroAuthManager {
                 .http_client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "cc-switch-kiro")
+                .header("User-Agent", KIRO_DESKTOP_USER_AGENT)
                 .json(&serde_json::json!({ "refreshToken": acc.refresh_token }))
                 .send()
                 .await
@@ -815,11 +895,13 @@ impl KiroAuthManager {
         } else {
             // IDC OIDC Refresh
             let sso_endpoint = format!("https://oidc.{}.amazonaws.com", acc.region);
+            let (oidc_ua, oidc_amz_ua) = kiro_user_agent(KiroSdkApi::Ssooidc, "E");
             let res = self
                 .http_client
                 .post(format!("{sso_endpoint}/token"))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "cc-switch-kiro")
+                .header("User-Agent", oidc_ua)
+                .header("x-amz-user-agent", oidc_amz_ua)
                 .json(&serde_json::json!({
                     "clientId": acc.client_id,
                     "clientSecret": acc.client_secret,
@@ -1027,13 +1109,15 @@ impl KiroAuthManager {
     ) -> Result<Option<(ClientRegisterResponse, DeviceAuthResponse, String)>, String> {
         let oidc_endpoint = format!("https://oidc.{region}.amazonaws.com");
 
+        let (oidc_ua, oidc_amz_ua) = kiro_user_agent(KiroSdkApi::Ssooidc, "E");
         let reg_res = self
             .http_client
             .post(format!("{oidc_endpoint}/client/register"))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "cc-switch-kiro")
+            .header("User-Agent", oidc_ua.clone())
+            .header("x-amz-user-agent", oidc_amz_ua.clone())
             .json(&serde_json::json!({
-                "clientName": "cc-switch",
+                "clientName": KIRO_CLIENT_NAME,
                 "clientType": "public",
                 "scopes": SSO_SCOPES,
                 "grantTypes": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"]
@@ -1059,7 +1143,8 @@ impl KiroAuthManager {
             .http_client
             .post(format!("{oidc_endpoint}/device_authorization"))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "cc-switch-kiro")
+            .header("User-Agent", oidc_ua)
+            .header("x-amz-user-agent", oidc_amz_ua)
             .json(&serde_json::json!({
                 "clientId": reg_data.client_id,
                 "clientSecret": reg_data.client_secret,
@@ -1177,11 +1262,13 @@ impl KiroAuthManager {
         }
 
         let oidc_endpoint = format!("https://oidc.{}.amazonaws.com", info.region);
+        let (oidc_ua, oidc_amz_ua) = kiro_user_agent(KiroSdkApi::Ssooidc, "E");
         let res = self
             .http_client
             .post(format!("{oidc_endpoint}/token"))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "cc-switch-kiro")
+            .header("User-Agent", oidc_ua)
+            .header("x-amz-user-agent", oidc_amz_ua)
             .json(&serde_json::json!({
                 "clientId": info.client_id,
                 "clientSecret": info.client_secret,
@@ -1299,6 +1386,10 @@ impl KiroAuthManager {
             .header("Content-Type", "application/x-amz-json-1.0")
             .header("Authorization", format!("Bearer {access_token}"))
             .header("X-Amz-Target", target);
+        let (runtime_ua, runtime_amz_ua) = kiro_user_agent(KiroSdkApi::CodewhispererRuntime, "F,C");
+        req = req
+            .header("User-Agent", runtime_ua)
+            .header("x-amz-user-agent", runtime_amz_ua);
         if use_api_key {
             req = req.header("tokentype", "API_KEY");
         }
@@ -1551,7 +1642,7 @@ impl KiroAuthManager {
                 .http_client
                 .post(&token_url)
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "cc-switch-kiro")
+                .header("User-Agent", KIRO_DESKTOP_USER_AGENT)
                 .json(&serde_json::json!({
                     "code": code,
                     "code_verifier": code_verifier,
