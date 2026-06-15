@@ -382,36 +382,32 @@ pub fn create_anthropic_sse_stream_from_kiro<E: std::error::Error + Send + 'stat
                                     current_tool_id = None;
                                 }
                             }
-                            KiroStreamEvent::ToolUseInput(input) => {
-                                if current_block_type == Some("tool_use") {
-                                    if let Some(idx) = current_block_index {
-                                        let block_delta = json!({
-                                            "type": "content_block_delta",
-                                            "index": idx,
-                                            "delta": {
-                                                "type": "input_json_delta",
-                                                "partial_json": input
-                                            }
-                                        });
-                                        let data = serde_json::to_string(&block_delta).map_err(std::io::Error::other)?;
-                                        yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", data)));
-                                    }
+                            KiroStreamEvent::ToolUseInput(input) if current_block_type == Some("tool_use") => {
+                                if let Some(idx) = current_block_index {
+                                    let block_delta = json!({
+                                        "type": "content_block_delta",
+                                        "index": idx,
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": input
+                                        }
+                                    });
+                                    let data = serde_json::to_string(&block_delta).map_err(std::io::Error::other)?;
+                                    yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", data)));
                                 }
                             }
-                            KiroStreamEvent::ToolUseStop(stop) => {
-                                if stop && current_block_type == Some("tool_use") {
-                                    if let Some(idx) = current_block_index {
-                                        let block_stop = json!({
-                                            "type": "content_block_stop",
-                                            "index": idx
-                                        });
-                                        let data = serde_json::to_string(&block_stop).map_err(std::io::Error::other)?;
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", data)));
-                                    }
-                                    current_block_index = None;
-                                    current_block_type = None;
-                                    current_tool_id = None;
+                            KiroStreamEvent::ToolUseStop(stop) if stop && current_block_type == Some("tool_use") => {
+                                if let Some(idx) = current_block_index {
+                                    let block_stop = json!({
+                                        "type": "content_block_stop",
+                                        "index": idx
+                                    });
+                                    let data = serde_json::to_string(&block_stop).map_err(std::io::Error::other)?;
+                                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", data)));
                                 }
+                                current_block_index = None;
+                                current_block_type = None;
+                                current_tool_id = None;
                             }
                             KiroStreamEvent::Usage { input_tokens, output_tokens } => {
                                 latest_usage = Some(json!({
@@ -567,10 +563,8 @@ pub fn kiro_eventstream_to_anthropic_response(body: &[u8]) -> Result<Value, Stri
                     buf.push_str(&input);
                 }
             }
-            KiroStreamEvent::ToolUseStop(stop) => {
-                if stop {
-                    flush_tool(&mut current_tool, &mut content_blocks);
-                }
+            KiroStreamEvent::ToolUseStop(stop) if stop => {
+                flush_tool(&mut current_tool, &mut content_blocks);
             }
             KiroStreamEvent::Usage {
                 input_tokens: it,
