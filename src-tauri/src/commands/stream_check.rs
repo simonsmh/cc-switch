@@ -144,9 +144,6 @@ pub fn save_stream_check_config(
     state.db.save_stream_check_config(&config)
 }
 
-/// Copilot 供应商的 base_url 需要从 OAuth 管理器动态解析（按账号或默认端点）。
-/// `is_full_url` 的供应商已是完整地址，无需解析。
-
 /// Kiro（AWS CodeWhisperer，托管 OAuth）专用连通性探测。
 ///
 /// 与代理转发路径一致：解析 OAuth token 与区域，向
@@ -157,8 +154,12 @@ async fn check_kiro_provider(
     config: &StreamCheckConfig,
     kiro_state: &State<'_, KiroAuthState>,
 ) -> StreamCheckResult {
-    let model =
-        StreamCheckService::resolve_effective_test_model(&AppType::Claude, provider, config);
+    let model = provider
+        .settings_config
+        .pointer("/env/ANTHROPIC_MODEL")
+        .and_then(|v| v.as_str())
+        .unwrap_or("anthropic.claude-3-5-sonnet")
+        .to_string();
     let now = chrono::Utc::now().timestamp();
 
     let failed = |message: String, http_status: Option<u16>| StreamCheckResult {
@@ -291,6 +292,8 @@ async fn check_kiro_provider(
         failed(format!("Kiro 返回 HTTP {code}: {snippet}"), Some(code))
     }
 }
+/// Copilot 供应商的 base_url 需要从 OAuth 管理器动态解析（按账号或默认端点）。
+/// `is_full_url` 的供应商已是完整地址，无需解析。
 async fn resolve_copilot_base_url_override(
     provider: &crate::provider::Provider,
     copilot_state: &State<'_, CopilotAuthState>,
