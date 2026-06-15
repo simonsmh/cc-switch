@@ -158,7 +158,7 @@ async fn check_kiro_provider(
         .settings_config
         .pointer("/env/ANTHROPIC_MODEL")
         .and_then(|v| v.as_str())
-        .unwrap_or("anthropic.claude-3-5-sonnet")
+        .unwrap_or("auto")
         .to_string();
     let now = chrono::Utc::now().timestamp();
 
