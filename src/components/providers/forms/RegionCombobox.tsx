@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 
 /** 常见的 AWS 区域（与 IdC 探测列表保持一致的优先项） */
 export const COMMON_AWS_REGIONS = [
+  "us-east-1",
   "af-south-1",
   "ap-east-1",
   "ap-northeast-1",
@@ -43,7 +44,6 @@ export const COMMON_AWS_REGIONS = [
   "me-central-1",
   "me-south-1",
   "sa-east-1",
-  "us-east-1",
   "us-east-2",
   "us-west-1",
   "us-west-2",
