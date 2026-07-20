@@ -60,6 +60,7 @@ pub use codex::{
     inject_codex_chat_prompt_cache_key, is_codex_official_provider,
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
     should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
+    should_convert_codex_responses_to_kiro,
 };
 pub use gemini::GeminiAdapter;
 
@@ -188,7 +189,13 @@ impl ProviderType {
                 }
                 ProviderType::Claude
             }
-            AppType::Codex => ProviderType::Codex,
+            AppType::Codex => {
+                if provider.is_kiro() {
+                    ProviderType::Kiro
+                } else {
+                    ProviderType::Codex
+                }
+            }
             AppType::Gemini => {
                 // 检测是否为 CLI 模式（OAuth）
                 let adapter = GeminiAdapter::new();
@@ -205,7 +212,13 @@ impl ProviderType {
                 }
                 ProviderType::Gemini
             }
-            AppType::GrokBuild => ProviderType::Codex,
+            AppType::GrokBuild => {
+                if provider.is_kiro() {
+                    ProviderType::Kiro
+                } else {
+                    ProviderType::Codex
+                }
+            }
             AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => ProviderType::Codex,
         }
     }

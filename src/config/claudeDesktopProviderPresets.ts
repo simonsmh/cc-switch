@@ -409,7 +409,7 @@ export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
     providerType: "kiro",
     requiresOAuth: true,
     modelRoutes: brandedRoutes(
-      "claude-sonnet-4-6",
+      "claude-sonnet-5",
       "claude-opus-4-8",
       "claude-haiku-4-5",
     ),

@@ -226,11 +226,13 @@ impl RequestForwarder {
         provider_body: &Value,
         error: &ProxyError,
     ) -> bool {
-        if adapter_name != "Claude" || api_format != "kiro" || already_retried {
+        if !matches!(adapter_name, "Claude" | "Codex") || api_format != "kiro" || already_retried {
             return false;
         }
-        // 仅在请求带了 thinking 时才有意义（否则 anthropic_to_kiro 不会生成该字段）
-        let has_thinking = provider_body.get("thinking").is_some();
+        // Claude 原始请求使用 thinking；Codex Responses 原始请求使用 reasoning，
+        // 后者会在 Responses -> Anthropic 阶段转换为 thinking。
+        let has_thinking =
+            provider_body.get("thinking").is_some() || provider_body.get("reasoning").is_some();
         if !has_thinking {
             return false;
         }
@@ -614,6 +616,7 @@ impl RequestForwarder {
                         let mut retry_body = provider_body.clone();
                         if let Some(obj) = retry_body.as_object_mut() {
                             obj.remove("thinking");
+                            obj.remove("reasoning");
                             obj.remove("output_config");
                         }
                         log::info!(
@@ -1272,8 +1275,7 @@ impl RequestForwarder {
         // （Kiro Q API 仅部署在 us-east-1 / eu-central-1，其他 region 需映射；
         //  否则会连到不存在的 runtime.<region>.kiro.dev）
         {
-            let kiro_api_format = adapter.name() == "Claude"
-                && super::providers::get_claude_api_format(provider) == "kiro";
+            let kiro_api_format = provider.is_kiro();
             if kiro_api_format && base_url.contains("kiro.dev") {
                 if let Some(app_handle) = &self.app_handle {
                     use crate::commands::KiroAuthState;
@@ -1313,6 +1315,8 @@ impl RequestForwarder {
         // catalog matching and to the transform's own strip+beta detection).
         let codex_responses_to_chat = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
+        let codex_responses_to_kiro = matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && super::providers::should_convert_codex_responses_to_kiro(provider, endpoint);
         let codex_responses_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
@@ -1349,7 +1353,7 @@ impl RequestForwarder {
                 super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
             self.apply_copilot_live_model_resolution(provider, &mut mapped_body)
                 .await;
-        } else if !codex_responses_to_anthropic {
+        } else if !codex_responses_to_anthropic && !codex_responses_to_kiro {
             // Skip on the Codex→Anthropic path: stripping [1m] here would break both the
             // model-catalog match (apply_codex_upstream_model) and the transform's own
             // strip+`context-1m` beta detection. The marker is stripped later, on the
@@ -1525,6 +1529,9 @@ impl RequestForwarder {
                 == Some(true);
         let (effective_endpoint, passthrough_query) = if codex_responses_to_chat {
             rewrite_codex_responses_endpoint_to_chat(endpoint)
+        } else if codex_responses_to_kiro {
+            let (_, query) = split_endpoint_and_query(endpoint);
+            ("/".to_string(), query.map(ToString::to_string))
         } else if codex_responses_to_anthropic {
             rewrite_codex_responses_endpoint_to_anthropic(endpoint)
         } else if needs_transform && adapter.name() == "Claude" {
@@ -1552,7 +1559,10 @@ impl RequestForwarder {
         let codex_anthropic_base_is_full_endpoint =
             codex_responses_to_anthropic && base_url_is_full_endpoint(&base_url, "/v1/messages");
 
-        let url = if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
+        let url = if codex_responses_to_kiro {
+            let runtime_url = format!("{}/", base_url.trim_end_matches('/'));
+            append_query_to_full_url(&runtime_url, passthrough_query.as_deref())
+        } else if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
             super::gemini_url::resolve_gemini_native_url(
                 &base_url,
                 &effective_endpoint,
@@ -1611,6 +1621,65 @@ impl RequestForwarder {
                     .then_some(self.session_id.as_str()),
             );
             chat_body
+        } else if codex_responses_to_kiro {
+            let mut mapped_body = mapped_body;
+            super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            let kiro_reasoning_effort = mapped_body
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|effort| matches!(*effort, "low" | "medium" | "high" | "xhigh" | "max"))
+                .map(str::to_string);
+            const DEFAULT_CODEX_KIRO_MAX_TOKENS: u64 = 8192;
+            let mut anthropic_body =
+                super::providers::transform_codex_anthropic::responses_request_to_anthropic(
+                    mapped_body,
+                    DEFAULT_CODEX_KIRO_MAX_TOKENS,
+                )?;
+            if let Some(effort) = kiro_reasoning_effort {
+                anthropic_body["thinking"] = serde_json::json!({ "type": "adaptive" });
+                anthropic_body["output_config"] = serde_json::json!({ "effort": effort });
+            }
+
+            let mut profile_arn = None;
+            if let Some(app_handle) = &self.app_handle {
+                use crate::commands::KiroAuthState;
+                let kiro_state = app_handle.state::<KiroAuthState>();
+                let kiro_auth = kiro_state.0.read().await;
+                let account_id = provider
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.managed_account_id_for("kiro"));
+                profile_arn = kiro_auth
+                    .get_profile_arn_for_account(account_id.as_deref())
+                    .await;
+                if anthropic_body.get("thinking").is_some() {
+                    let kiro_model_id = super::providers::transform_kiro::map_model_to_kiro(
+                        anthropic_body
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or("auto"),
+                    );
+                    if super::providers::transform_kiro::get_model_caps(&kiro_model_id).is_none() {
+                        if let Err(error) =
+                            crate::commands::fetch_kiro_models(&kiro_auth, account_id.as_deref())
+                                .await
+                        {
+                            log::debug!(
+                                "[Codex/Kiro] 能力缓存预热失败（将回退到 400 重试）: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            super::providers::transform_kiro::anthropic_to_kiro(
+                anthropic_body,
+                provider,
+                self.session_client_provided
+                    .then_some(self.session_id.as_str()),
+                profile_arn,
+            )?
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
@@ -1767,6 +1836,7 @@ impl RequestForwarder {
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
+            || codex_responses_to_kiro
             || codex_responses_to_anthropic
             || request_is_streaming;
 
@@ -2089,6 +2159,16 @@ impl RequestForwarder {
                 continue;
             }
 
+            // Kiro's AWS JSON protocol headers come from the managed auth
+            // adapter. Do not also forward the client's JSON media type or
+            // identity: duplicate Content-Type values can make the runtime
+            // miss X-Amz-Target dispatch and return UnknownOperationException.
+            if provider.is_kiro()
+                && matches!(key_str, "content-type" | "user-agent" | "x-amz-user-agent")
+            {
+                continue;
+            }
+
             // --- 连接 / 追踪 / CDN 类 — 无条件跳过 ---
             if matches!(
                 key_str,
@@ -2159,7 +2239,9 @@ impl RequestForwarder {
             // can defeat strict gateway fingerprint checks.
             // The full set lives in `is_codex_client_fingerprint_header` so it stays in one
             // place. (HeaderName is lowercased by the http crate, so a direct match is safe.)
-            if codex_responses_to_anthropic && is_codex_client_fingerprint_header(key_str) {
+            if (codex_responses_to_anthropic || codex_responses_to_kiro)
+                && is_codex_client_fingerprint_header(key_str)
+            {
                 continue;
             }
 
@@ -2168,7 +2250,9 @@ impl RequestForwarder {
             // Anthropic client sends `application/json` (streaming is driven by
             // the body's stream:true). Strict Anthropic gateways return 406 Not
             // Acceptable for an event-stream Accept, so normalize it here.
-            if codex_responses_to_anthropic && key_str.eq_ignore_ascii_case("accept") {
+            if (codex_responses_to_anthropic || codex_responses_to_kiro)
+                && key_str.eq_ignore_ascii_case("accept")
+            {
                 if !saw_accept {
                     saw_accept = true;
                     ordered_headers.append(
@@ -2258,7 +2342,7 @@ impl RequestForwarder {
         }
 
         // On the Codex→Anthropic path, add application/json when Accept is missing (matching a native Anthropic client).
-        if codex_responses_to_anthropic && !saw_accept {
+        if (codex_responses_to_anthropic || codex_responses_to_kiro) && !saw_accept {
             ordered_headers.append(
                 http::header::ACCEPT,
                 http::HeaderValue::from_static("application/json"),
@@ -2340,7 +2424,8 @@ impl RequestForwarder {
             .and_then(|v| v.as_str())
             // Kiro 转换后顶层无 model 字段，模型 ID 在 conversationState 内的 modelId
             .or_else(|| {
-                if resolved_claude_api_format.as_deref() == Some("kiro") {
+                if resolved_claude_api_format.as_deref() == Some("kiro") || codex_responses_to_kiro
+                {
                     filtered_body
                         .pointer("/conversationState/currentMessage/userInputMessage/modelId")
                         .and_then(|v| v.as_str())
@@ -4955,6 +5040,10 @@ mod tests {
             "thinking": {"type": "enabled"}
         });
         let body_no_thinking = json!({"model": "claude-haiku-4-5"});
+        let codex_body_with_reasoning = json!({
+            "model": "claude-haiku-4-5",
+            "reasoning": {"effort": "high"}
+        });
         let err_unsupported = ProxyError::UpstreamError {
             status: 400,
             body: Some("additionalModelRequestFields is not supported for this model".to_string()),
@@ -4971,6 +5060,16 @@ mod tests {
                 "kiro",
                 false,
                 &body_with_thinking,
+                &err_unsupported
+            )
+        );
+        // Codex Responses reasoning 也会转换成 Kiro additionalModelRequestFields。
+        assert!(
+            RequestForwarder::kiro_additional_fields_retry_should_trigger(
+                "Codex",
+                "kiro",
+                false,
+                &codex_body_with_reasoning,
                 &err_unsupported
             )
         );

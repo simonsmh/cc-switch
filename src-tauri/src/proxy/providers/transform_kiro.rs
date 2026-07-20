@@ -542,7 +542,10 @@ pub fn anthropic_to_kiro(
     // 能力驱动：仅在模型明确支持 effort 时才加；能力未知（冷启动/未拉取过
     // 模型列表）则保守性加上，由 forwarder 的 400 重试兑底。
     if let Some(thinking) = body.get("thinking") {
-        if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
+        if matches!(
+            thinking.get("type").and_then(|t| t.as_str()),
+            Some("enabled" | "adaptive")
+        ) {
             let allow_effort = model_caps.map(|c| c.supports_effort).unwrap_or(true);
             if allow_effort {
                 let effort = body
@@ -695,5 +698,22 @@ mod tests {
         );
         let out = anthropic_to_kiro(make_body("claude-sonnet-4-5"), &provider, None, None).unwrap();
         assert!(has_output_config(&out));
+
+        let out = anthropic_to_kiro(
+            json!({
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled"},
+                "output_config": {"effort": "xhigh"}
+            }),
+            &provider,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.pointer("/additionalModelRequestFields/output_config/effort"),
+            Some(&json!("xhigh"))
+        );
     }
 }

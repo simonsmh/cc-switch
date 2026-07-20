@@ -40,7 +40,7 @@ interface KiroAuthSectionProps {
  * Kiro 认证区块
  *
  * 通过 AWS Builder ID / IAM Identity Center 设备授权流程登录，
- * 用于将 Claude Code 请求反代到 Kiro 运行时。
+ * 用于将 Claude Code 或 Codex 请求反代到 Kiro 运行时。
  */
 export const KiroAuthSection: React.FC<KiroAuthSectionProps> = ({
   className,

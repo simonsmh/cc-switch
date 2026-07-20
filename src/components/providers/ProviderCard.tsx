@@ -232,7 +232,8 @@ export function ProviderCard({
     if (appId !== "codex" || provider.category === "official") return false;
     if (
       provider.meta?.apiFormat === "openai_chat" ||
-      provider.meta?.apiFormat === "anthropic"
+      provider.meta?.apiFormat === "anthropic" ||
+      provider.meta?.apiFormat === "kiro"
     )
       return true;
     const config = (provider.settingsConfig as Record<string, any>)?.config;

@@ -587,15 +587,17 @@ function ProviderFormFull({
       ? "openai_chat"
       : initialData?.meta?.apiFormat === "anthropic"
         ? "anthropic"
-        : initialData?.meta?.apiFormat === "openai_responses"
-          ? "openai_responses"
-          : (codexApiFormatFromWireApi(
-              extractCodexWireApi(
-                typeof initialData?.settingsConfig?.config === "string"
-                  ? initialData.settingsConfig.config
-                  : "",
-              ),
-            ) ?? "openai_responses");
+        : initialData?.meta?.apiFormat === "kiro"
+          ? "kiro"
+          : initialData?.meta?.apiFormat === "openai_responses"
+            ? "openai_responses"
+            : (codexApiFormatFromWireApi(
+                extractCodexWireApi(
+                  typeof initialData?.settingsConfig?.config === "string"
+                    ? initialData.settingsConfig.config
+                    : "",
+                ),
+              ) ?? "openai_responses");
 
   const [localCodexApiFormat, setLocalCodexApiFormat] =
     useState<CodexApiFormat>(initialCodexApiFormat);
@@ -725,6 +727,16 @@ function ProviderFormFull({
     settingsConfig: form.getValues("settingsConfig"),
     onConfigChange: handleSettingsConfigChange,
   });
+
+  const selectedCodexPreset = useMemo(() => {
+    if (appId !== "codex" || selectedPresetId === "custom") return undefined;
+    return presetEntries.find((entry) => entry.id === selectedPresetId)
+      ?.preset as CodexProviderPreset | undefined;
+  }, [appId, presetEntries, selectedPresetId]);
+  const effectiveProviderType =
+    templatePreset?.providerType ??
+    selectedCodexPreset?.providerType ??
+    initialData?.meta?.providerType;
 
   const {
     useCommonConfig,
@@ -1172,9 +1184,7 @@ function ProviderFormFull({
       return;
     }
 
-    const isKiroProvider =
-      templatePreset?.providerType === "kiro" ||
-      initialData?.meta?.providerType === "kiro";
+    const isKiroProvider = effectiveProviderType === "kiro";
     if (isKiroProvider && !isKiroAuthenticated) {
       toast.error(
         t("kiro.loginRequired", {
@@ -1239,14 +1249,14 @@ function ProviderFormFull({
           );
         }
       } else if (appId === "codex") {
-        if (!codexBaseUrl.trim()) {
+        if (!isKiroProvider && !codexBaseUrl.trim()) {
           issues.push(
             t("providerForm.endpointRequired", {
               defaultValue: "非官方供应商请填写 API 端点",
             }),
           );
         }
-        if (!codexApiKey.trim()) {
+        if (!isKiroProvider && !codexApiKey.trim()) {
           issues.push(
             t("providerForm.apiKeyRequired", {
               defaultValue: "非官方供应商请填写 API Key",
@@ -1304,9 +1314,7 @@ function ProviderFormFull({
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
-    const isKiroProvider =
-      templatePreset?.providerType === "kiro" ||
-      initialData?.meta?.providerType === "kiro";
+    const isKiroProvider = effectiveProviderType === "kiro";
 
     let settingsConfig: string;
 
@@ -1483,8 +1491,7 @@ function ProviderFormFull({
       payload.meta ?? (initialData?.meta ? { ...initialData.meta } : undefined);
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
-    const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+    const providerType = effectiveProviderType;
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
@@ -2257,6 +2264,10 @@ function ProviderFormFull({
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}
               onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
+              isKiroPreset={effectiveProviderType === "kiro"}
+              isKiroAuthenticated={isKiroAuthenticated}
+              selectedKiroAccountId={selectedKiroAccountId}
+              onKiroAccountSelect={setSelectedKiroAccountId}
             />
           )}
 

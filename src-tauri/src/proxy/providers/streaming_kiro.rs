@@ -7,6 +7,7 @@ use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 const EVENT_PATTERNS: &[&str] = &[
+    "{\"Output\":",
     "{\"content\":",
     "{\"name\":",
     "{\"input\":",
@@ -90,6 +91,20 @@ fn find_next_event_start(buffer: &str, from: usize) -> Option<usize> {
 }
 
 fn parse_kiro_event(parsed: &Value) -> Option<KiroStreamEvent> {
+    if let Some(output) = parsed.get("Output").and_then(Value::as_object) {
+        let error = output
+            .get("__type")
+            .or_else(|| output.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("KiroRuntimeError")
+            .to_string();
+        let message = output
+            .get("message")
+            .or_else(|| output.get("Message"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        return Some(KiroStreamEvent::Error { error, message });
+    }
     if let Some(content) = parsed.get("content").and_then(|v| v.as_str()) {
         return Some(KiroStreamEvent::Content(content.to_string()));
     }
@@ -178,9 +193,12 @@ fn parse_kiro_event(parsed: &Value) -> Option<KiroStreamEvent> {
 fn parse_kiro_events(buffer: &str) -> (Vec<KiroStreamEvent>, String) {
     let mut events = Vec::new();
     let mut pos = 0;
-    // 最长的 event pattern 是 {"contextUsagePercentage": (25 bytes)
-    // 保留尾部这么多字节,避免跨 chunk 的部分 pattern 丢失
-    const MAX_PATTERN_LEN: usize = 25;
+    // Keep enough unconsumed tail bytes for any event prefix split across chunks.
+    let max_pattern_len = EVENT_PATTERNS
+        .iter()
+        .map(|pattern| pattern.len())
+        .max()
+        .unwrap_or(1);
 
     while pos < buffer.len() {
         let json_start = match find_next_event_start(buffer, pos) {
@@ -190,7 +208,10 @@ fn parse_kiro_events(buffer: &str) -> (Vec<KiroStreamEvent>, String) {
                 // 1) buffer[pos..] 全是非 event 数据(空白/乱码) -> 安全丢弃
                 // 2) buffer[pos..] 是部分 pattern(如 {"con) -> 必须保留尾部
                 // 策略:保留最后 MAX_PATTERN_LEN-1 字节,足够容纳任何部分 pattern
-                let keep_from = buffer.len().saturating_sub(MAX_PATTERN_LEN - 1);
+                // Only retain bytes that have not already been consumed. Using
+                // the whole buffer here replays short JSON events whenever an
+                // AWS EventStream frame trailer follows them in the same chunk.
+                let keep_from = pos.max(buffer.len().saturating_sub(max_pattern_len - 1));
                 return (events, buffer[keep_from..].to_string());
             }
         };
@@ -672,6 +693,16 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_aws_output_error_envelope_returns_err() {
+        let body = br#"{"Output":{"__type":"com.amazon.coral.service#UnknownOperationException","message":"The requested operation is not recognized by the service."},"Version":"1.0"}"#;
+        let error = kiro_eventstream_to_anthropic_response(body).unwrap_err();
+        assert_eq!(
+            error,
+            "The requested operation is not recognized by the service."
+        );
+    }
+
+    #[test]
     fn parse_preserves_partial_pattern_across_chunks() {
         // 模拟跨 chunk 的部分 pattern: {"con 应该被保留到 remainder
         let chunk1 = r#"{"content":"hi"}{"con"#;
@@ -691,5 +722,39 @@ mod tests {
         assert!(events2
             .iter()
             .any(|e| matches!(e, KiroStreamEvent::Content(t) if t == "world")));
+    }
+
+    #[test]
+    fn parse_does_not_replay_short_event_before_frame_trailer() {
+        let (first, remainder) = parse_kiro_events("{\"content\":\"Hi\"}\0\0\0");
+        assert_eq!(first.len(), 1);
+        assert!(matches!(&first[0], KiroStreamEvent::Content(text) if text == "Hi"));
+        assert_eq!(remainder, "\0\0\0");
+
+        let combined = format!("{remainder}{{\"content\":\"!\"}}\0");
+        let (second, _) = parse_kiro_events(&combined);
+        assert_eq!(second.len(), 1);
+        assert!(matches!(&second[0], KiroStreamEvent::Content(text) if text == "!"));
+    }
+
+    #[tokio::test]
+    async fn streaming_adapter_emits_each_short_framed_delta_once() {
+        let upstream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\0frame{\"content\":\"Hi\"}\0\0\0")),
+            Ok(Bytes::from_static(b"\0frame{\"content\":\"!\"}\0")),
+        ]);
+        let output = create_anthropic_sse_stream_from_kiro(upstream)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let text = output
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk))
+            .collect::<String>();
+
+        assert_eq!(text.matches("\"text\":\"Hi\"").count(), 1);
+        assert_eq!(text.matches("\"text\":\"!\"").count(), 1);
     }
 }
