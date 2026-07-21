@@ -160,6 +160,10 @@ export const normalizeCodexCatalogModelsForSave = (
     );
 
     const baseInstructions = item.baseInstructions?.trim();
+    const reasoningEfforts = item.reasoningEfforts
+      ?.filter((effort) => typeof effort === "string" && effort.trim())
+      .map((effort) => effort.trim());
+    const defaultReasoningEffort = item.defaultReasoningEffort?.trim();
 
     normalized.push({
       model,
@@ -173,6 +177,10 @@ export const normalizeCodexCatalogModelsForSave = (
         ? { inputModalities }
         : {}),
       ...(baseInstructions ? { baseInstructions } : {}),
+      ...(reasoningEfforts && reasoningEfforts.length > 0
+        ? { reasoningEfforts }
+        : {}),
+      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     });
   }
 
