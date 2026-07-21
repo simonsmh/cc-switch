@@ -45,6 +45,102 @@ pub enum KiroStreamEvent {
     },
 }
 
+#[derive(Debug, PartialEq)]
+enum ContentSegment {
+    Text(String),
+    Thinking(String),
+}
+
+#[derive(Default)]
+struct ThinkingTagParser {
+    buffer: String,
+    closing_tag: Option<&'static str>,
+}
+
+const THINKING_TAGS: &[(&str, &str)] = &[
+    ("<thinking>", "</thinking>"),
+    ("<think>", "</think>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+];
+
+impl ThinkingTagParser {
+    fn process(&mut self, chunk: &str) -> Vec<ContentSegment> {
+        self.buffer.push_str(chunk);
+        let mut output = Vec::new();
+        loop {
+            if let Some(close) = self.closing_tag {
+                if let Some(position) = self.buffer.find(close) {
+                    if position > 0 {
+                        output.push(ContentSegment::Thinking(
+                            self.buffer[..position].to_string(),
+                        ));
+                    }
+                    self.buffer.drain(..position + close.len());
+                    self.closing_tag = None;
+                    if self.buffer.starts_with("\n\n") {
+                        self.buffer.drain(..2);
+                    }
+                    continue;
+                }
+                let retained = trailing_tag_prefix_len(&self.buffer, &[close]);
+                let safe = self.buffer.len() - retained;
+                if safe > 0 {
+                    output.push(ContentSegment::Thinking(self.buffer[..safe].to_string()));
+                    self.buffer.drain(..safe);
+                }
+                break;
+            }
+
+            let found = THINKING_TAGS
+                .iter()
+                .filter_map(|(open, close)| self.buffer.find(open).map(|pos| (pos, *open, *close)))
+                .min_by_key(|(pos, _, _)| *pos);
+            if let Some((position, open, close)) = found {
+                if position > 0 {
+                    output.push(ContentSegment::Text(self.buffer[..position].to_string()));
+                }
+                self.buffer.drain(..position + open.len());
+                self.closing_tag = Some(close);
+                continue;
+            }
+            let opens: Vec<&str> = THINKING_TAGS.iter().map(|(open, _)| *open).collect();
+            let retained = trailing_tag_prefix_len(&self.buffer, &opens);
+            let safe = self.buffer.len() - retained;
+            if safe > 0 {
+                output.push(ContentSegment::Text(self.buffer[..safe].to_string()));
+                self.buffer.drain(..safe);
+            }
+            break;
+        }
+        output
+    }
+
+    fn finish(&mut self) -> Option<ContentSegment> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let value = std::mem::take(&mut self.buffer);
+        Some(if self.closing_tag.is_some() {
+            ContentSegment::Thinking(value)
+        } else {
+            ContentSegment::Text(value)
+        })
+    }
+}
+
+fn trailing_tag_prefix_len(text: &str, tags: &[&str]) -> usize {
+    tags.iter()
+        .map(|tag| {
+            (1..tag.len())
+                .rev()
+                .find(|length| text.ends_with(&tag[..*length]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn find_json_end_bytes(text: &str, start_byte: usize) -> Option<usize> {
     let mut brace_count = 0;
     let mut in_string = false;
@@ -251,6 +347,9 @@ pub fn create_anthropic_sse_stream_from_kiro<E: std::error::Error + Send + 'stat
         let mut current_tool_id: Option<String> = None;
         let mut latest_usage: Option<Value> = None;
         let mut has_tool_calls = false;
+        let mut thinking_parser = ThinkingTagParser::default();
+        let stream_started = std::time::Instant::now();
+        let mut logged_first_content = false;
 
         tokio::pin!(stream);
 
@@ -264,64 +363,46 @@ pub fn create_anthropic_sse_stream_from_kiro<E: std::error::Error + Send + 'stat
                     for event in events {
                         match event {
                             KiroStreamEvent::Content(text) => {
-                                if !has_sent_message_start {
-                                    let msg_start = json!({
-                                        "type": "message_start",
-                                        "message": {
-                                            "id": format!("msg_kiro{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-                                            "type": "message",
-                                            "role": "assistant",
-                                            "content": [],
-                                            "model": "claude-sonnet",
-                                            "stop_reason": null,
-                                            "stop_sequence": null,
-                                            "usage": {
-                                                "input_tokens": 0,
-                                                "output_tokens": 0
-                                            }
-                                        }
-                                    });
-                                    let data = serde_json::to_string(&msg_start).map_err(std::io::Error::other)?;
-                                    yield Ok(Bytes::from(format!("event: message_start\ndata: {}\n\n", data)));
-                                    has_sent_message_start = true;
-                                }
-
-                                if current_block_type != Some("text") {
-                                    if let Some(idx) = current_block_index {
-                                        let block_stop = json!({
-                                            "type": "content_block_stop",
-                                            "index": idx
+                                for segment in thinking_parser.process(&text) {
+                                    if !logged_first_content {
+                                        log::info!("[Kiro/TTFT] 首个内容事件 elapsed_ms={}", stream_started.elapsed().as_millis());
+                                        logged_first_content = true;
+                                    }
+                                    if !has_sent_message_start {
+                                        let msg_start = json!({
+                                            "type": "message_start",
+                                            "message": {"id": format!("msg_kiro{}", uuid::Uuid::new_v4().to_string().replace('-', "")), "type": "message", "role": "assistant", "content": [], "model": "claude-sonnet", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}
                                         });
-                                        let data = serde_json::to_string(&block_stop).map_err(std::io::Error::other)?;
-                                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", data)));
+                                        let data = serde_json::to_string(&msg_start).map_err(std::io::Error::other)?;
+                                        yield Ok(Bytes::from(format!("event: message_start\ndata: {}\n\n", data)));
+                                        has_sent_message_start = true;
                                     }
-
-                                    let block_start = json!({
-                                        "type": "content_block_start",
-                                        "index": next_content_index,
-                                        "content_block": {
-                                            "type": "text",
-                                            "text": ""
+                                    let (block_type, delta_type, field, value) = match segment {
+                                        ContentSegment::Text(value) => ("text", "text_delta", "text", value),
+                                        ContentSegment::Thinking(value) => ("thinking", "thinking_delta", "thinking", value),
+                                    };
+                                    if current_block_type != Some(block_type) {
+                                        if let Some(idx) = current_block_index {
+                                            let data = serde_json::to_string(&json!({"type": "content_block_stop", "index": idx})).map_err(std::io::Error::other)?;
+                                            yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", data)));
                                         }
-                                    });
-                                    let data = serde_json::to_string(&block_start).map_err(std::io::Error::other)?;
-                                    yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", data)));
-
-                                    current_block_index = Some(next_content_index);
-                                    current_block_type = Some("text");
-                                    next_content_index += 1;
-                                }
-
-                                let block_delta = json!({
-                                    "type": "content_block_delta",
-                                    "index": current_block_index.unwrap(),
-                                    "delta": {
-                                        "type": "text_delta",
-                                        "text": text
+                                        let content_block = if block_type == "thinking" {
+                                            json!({"type": "thinking", "thinking": ""})
+                                        } else {
+                                            json!({"type": "text", "text": ""})
+                                        };
+                                        let data = serde_json::to_string(&json!({"type": "content_block_start", "index": next_content_index, "content_block": content_block})).map_err(std::io::Error::other)?;
+                                        yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", data)));
+                                        current_block_index = Some(next_content_index);
+                                        current_block_type = Some(block_type);
+                                        next_content_index += 1;
                                     }
-                                });
-                                let data = serde_json::to_string(&block_delta).map_err(std::io::Error::other)?;
-                                yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", data)));
+                                    let mut delta = serde_json::Map::new();
+                                    delta.insert("type".to_string(), Value::String(delta_type.to_string()));
+                                    delta.insert(field.to_string(), Value::String(value));
+                                    let data = serde_json::to_string(&json!({"type": "content_block_delta", "index": current_block_index.unwrap(), "delta": delta})).map_err(std::io::Error::other)?;
+                                    yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", data)));
+                                }
                             }
                             KiroStreamEvent::ToolUse { name, tool_use_id, input, stop } => {
                                 has_tool_calls = true;
@@ -454,6 +535,33 @@ pub fn create_anthropic_sse_stream_from_kiro<E: std::error::Error + Send + 'stat
                     yield Err(std::io::Error::other(e.to_string()));
                 }
             }
+        }
+
+        // Flush a possible tag prefix split at the final transport chunk.
+        if let Some(segment) = thinking_parser.finish() {
+            if !has_sent_message_start {
+                let msg_start = json!({
+                    "type": "message_start",
+                    "message": {"id": format!("msg_kiro{}", uuid::Uuid::new_v4().to_string().replace('-', "")), "type": "message", "role": "assistant", "content": [], "model": "claude-sonnet", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}
+                });
+                yield Ok(Bytes::from(format!("event: message_start\ndata: {}\n\n", serde_json::to_string(&msg_start).unwrap())));
+            }
+            let (block_type, delta_type, field, value) = match segment {
+                ContentSegment::Text(value) => ("text", "text_delta", "text", value),
+                ContentSegment::Thinking(value) => ("thinking", "thinking_delta", "thinking", value),
+            };
+            if current_block_type != Some(block_type) {
+                if let Some(idx) = current_block_index {
+                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", json!({"type": "content_block_stop", "index": idx}))));
+                }
+                let content_block = if block_type == "thinking" { json!({"type": "thinking", "thinking": ""}) } else { json!({"type": "text", "text": ""}) };
+                yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", json!({"type": "content_block_start", "index": next_content_index, "content_block": content_block}))));
+                current_block_index = Some(next_content_index);
+            }
+            let mut delta = serde_json::Map::new();
+            delta.insert("type".to_string(), Value::String(delta_type.to_string()));
+            delta.insert(field.to_string(), Value::String(value));
+            yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", json!({"type": "content_block_delta", "index": current_block_index.unwrap(), "delta": delta}))));
         }
 
         // Close any remaining open blocks
@@ -756,5 +864,48 @@ mod tests {
 
         assert_eq!(text.matches("\"text\":\"Hi\"").count(), 1);
         assert_eq!(text.matches("\"text\":\"!\"").count(), 1);
+    }
+
+    #[test]
+    fn thinking_parser_handles_tags_split_across_chunks() {
+        let mut parser = ThinkingTagParser::default();
+        assert_eq!(
+            parser.process("prefix<think"),
+            vec![ContentSegment::Text("prefix".into())]
+        );
+        assert_eq!(
+            parser.process("ing>step 1</think"),
+            vec![ContentSegment::Thinking("step 1".into())]
+        );
+        assert_eq!(
+            parser.process("ing>\n\nanswer"),
+            vec![ContentSegment::Text("answer".into())]
+        );
+        assert_eq!(parser.finish(), None);
+    }
+
+    #[tokio::test]
+    async fn streaming_adapter_emits_thinking_delta_without_raw_tags() {
+        let upstream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"content\":\"<reason\"}")),
+            Ok(Bytes::from_static(
+                b"{\"content\":\"ing>plan</reasoning>done\"}",
+            )),
+        ]);
+        let output = create_anthropic_sse_stream_from_kiro(upstream)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let text = output
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk))
+            .collect::<String>();
+
+        assert!(text.contains("\"type\":\"thinking_delta\""));
+        assert!(text.contains("\"thinking\":\"plan\""));
+        assert!(text.contains("\"text\":\"done\""));
+        assert!(!text.contains("<reasoning>"));
     }
 }

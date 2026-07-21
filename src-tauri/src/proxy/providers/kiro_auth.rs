@@ -329,6 +329,11 @@ impl KiroAuthManager {
         }
     }
 
+    pub fn model_caps_cache_path(&self) -> PathBuf {
+        self.storage_path
+            .with_file_name("kiro_model_capabilities.json")
+    }
+
     /// 同步读取磁盘凭证（不涉及任何 tokio 锁），供构造函数使用。
     fn read_from_disk(
         storage_path: &Path,

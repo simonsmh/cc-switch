@@ -1002,7 +1002,14 @@ pub fn run() {
 
                 let app_config_dir = crate::config::get_app_config_dir();
                 let kiro_auth_manager = KiroAuthManager::new(app_config_dir);
-                app.manage(KiroAuthState(Arc::new(RwLock::new(kiro_auth_manager))));
+                let restored_caps = crate::proxy::providers::transform_kiro::load_model_caps_cache(
+                    &kiro_auth_manager.model_caps_cache_path(),
+                );
+                let kiro_auth_state = Arc::new(RwLock::new(kiro_auth_manager));
+                app.manage(KiroAuthState(kiro_auth_state.clone()));
+                if !restored_caps {
+                    commands::prewarm_kiro_models(kiro_auth_state, None);
+                }
                 log::info!("✓ KiroAuthManager initialized");
             }
 

@@ -6,6 +6,11 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::RwLock;
 
+fn model_fetch_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Kiro 认证状态
 pub struct KiroAuthState(pub Arc<RwLock<KiroAuthManager>>);
 
@@ -26,6 +31,7 @@ pub(crate) async fn fetch_kiro_models(
     manager: &KiroAuthManager,
     account_id: Option<&str>,
 ) -> Result<Vec<FetchedModel>, String> {
+    let _singleflight = model_fetch_lock().lock().await;
     // 获取当前账号的有效 Token
     let token = if let Some(id) = account_id {
         manager.get_valid_token_for_account(id).await?
@@ -118,7 +124,7 @@ pub(crate) async fn fetch_kiro_models(
         .map_err(|e| format!("解析 Kiro 模型列表响应失败: {e}"))?;
 
     let re = regex::Regex::new(r"(\d)\.(\d)").unwrap();
-    let models = data
+    let models: Vec<FetchedModel> = data
         .models
         .unwrap_or_default()
         .into_iter()
@@ -154,5 +160,37 @@ pub(crate) async fn fetch_kiro_models(
         })
         .collect();
 
+    if let Err(error) = crate::proxy::providers::transform_kiro::save_model_caps_cache(
+        &manager.model_caps_cache_path(),
+    ) {
+        log::warn!("[Kiro] 持久化模型能力缓存失败: {error}");
+    }
+
     Ok(models)
+}
+
+/// 非阻塞能力预热。并发请求共享一个管理面刷新，运行时请求无需等待。
+pub(crate) fn prewarm_kiro_models(state: Arc<RwLock<KiroAuthManager>>, account_id: Option<String>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PREWARM_RUNNING: AtomicBool = AtomicBool::new(false);
+    if PREWARM_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        log::debug!("[Kiro] 模型能力预热已在进行，跳过重复任务");
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let manager = state.read().await;
+        let started = std::time::Instant::now();
+        match fetch_kiro_models(&manager, account_id.as_deref()).await {
+            Ok(models) => log::info!(
+                "[Kiro/TTFT] 后台模型能力预热完成 models={} elapsed_ms={}",
+                models.len(),
+                started.elapsed().as_millis()
+            ),
+            Err(error) => log::debug!("[Kiro] 后台模型能力预热失败: {error}"),
+        }
+        PREWARM_RUNNING.store(false, Ordering::Release);
+    });
 }

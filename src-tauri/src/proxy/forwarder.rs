@@ -1268,6 +1268,7 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let forward_started = std::time::Instant::now();
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1661,14 +1662,11 @@ impl RequestForwarder {
                             .unwrap_or("auto"),
                     );
                     if super::providers::transform_kiro::get_model_caps(&kiro_model_id).is_none() {
-                        if let Err(error) =
-                            crate::commands::fetch_kiro_models(&kiro_auth, account_id.as_deref())
-                                .await
-                        {
-                            log::debug!(
-                                "[Codex/Kiro] 能力缓存预热失败（将回退到 400 重试）: {error}"
-                            );
-                        }
+                        crate::commands::prewarm_kiro_models(
+                            kiro_state.0.clone(),
+                            account_id.clone(),
+                        );
+                        log::debug!("[Codex/Kiro] 能力缓存未命中，已转为后台预热");
                     }
                 }
             }
@@ -1768,16 +1766,11 @@ impl RequestForwarder {
                             if super::providers::transform_kiro::get_model_caps(&kiro_model_id)
                                 .is_none()
                             {
-                                if let Err(e) = crate::commands::fetch_kiro_models(
-                                    &kiro_auth,
-                                    account_id.as_deref(),
-                                )
-                                .await
-                                {
-                                    log::debug!(
-                                        "[Kiro] 能力缓存预热失败（将回退到 400 重试）: {e}"
-                                    );
-                                }
+                                crate::commands::prewarm_kiro_models(
+                                    kiro_state.0.clone(),
+                                    account_id.clone(),
+                                );
+                                log::debug!("[Kiro] 能力缓存未命中，已转为后台预热");
                             }
                         }
                     }
@@ -2469,6 +2462,13 @@ impl RequestForwarder {
         );
 
         // 发送请求
+        let upstream_started = std::time::Instant::now();
+        if provider.is_kiro() {
+            log::info!(
+                "[Kiro/TTFT] 请求转换与鉴权完成 preflight_ms={}",
+                forward_started.elapsed().as_millis()
+            );
+        }
         let response = if is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
@@ -2527,11 +2527,25 @@ impl RequestForwarder {
 
         // 检查响应状态
         let status = response.status();
+        if provider.is_kiro() {
+            log::info!(
+                "[Kiro/TTFT] 收到上游响应头 upstream_headers_ms={} total_ms={} status={}",
+                upstream_started.elapsed().as_millis(),
+                forward_started.elapsed().as_millis(),
+                status
+            );
+        }
 
         if status.is_success() {
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
+            if provider.is_kiro() && request_is_streaming {
+                log::info!(
+                    "[Kiro/TTFT] 收到上游首个传输块 total_ms={}",
+                    forward_started.elapsed().as_millis()
+                );
+            }
             // Streaming requests normally return SSE. If a compatible gateway
             // explicitly returns JSON instead, buffer and validate it inside the retry
             // loop as well so a 2xx Anthropic error envelope can still fail over. Do

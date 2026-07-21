@@ -6,18 +6,28 @@ use crate::proxy::error::ProxyError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// 模型能力（是否支持 thinking / output_config.effort）。
 /// 来自 ListAvailableModels 返回的 additionalModelRequestFieldsSchema。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct KiroModelCaps {
     /// 模型是否支持 thinking 字段（预留；cc-switch 目前仅用 effort 门控）。
     #[allow(dead_code)]
     pub supports_thinking: bool,
     pub supports_effort: bool,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedModelCaps {
+    updated_at_ms: u64,
+    models: HashMap<String, KiroModelCaps>,
+}
+
+const MODEL_CAPS_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// 全局模型能力缓存（kiro_model_id -> caps）。模型能力是全局的，
 /// 与账号无关，所以以 Kiro 侧 modelId 为键。get_kiro_models 拉取时写入，
@@ -40,6 +50,53 @@ pub fn get_model_caps(kiro_model_id: &str) -> Option<KiroModelCaps> {
         .read()
         .ok()
         .and_then(|m| m.get(kiro_model_id).copied())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// 启动时恢复仍在 TTL 内的能力缓存。损坏或过期文件不会影响代理启动。
+pub fn load_model_caps_cache(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(saved) = serde_json::from_str::<PersistedModelCaps>(&content) else {
+        log::warn!("[Kiro] 忽略无法解析的模型能力缓存: {}", path.display());
+        return false;
+    };
+    if now_ms().saturating_sub(saved.updated_at_ms) > MODEL_CAPS_TTL_MS {
+        log::info!("[Kiro] 模型能力缓存已过期，将在后台刷新");
+        return false;
+    }
+    let count = saved.models.len();
+    if let Ok(mut cache) = caps_cache().write() {
+        *cache = saved.models;
+    }
+    log::info!("[Kiro] 已从磁盘恢复 {count} 个模型能力");
+    count > 0
+}
+
+/// 原子持久化当前能力缓存，避免每次进程冷启动都访问 Kiro 管理面。
+pub fn save_model_caps_cache(path: &Path) -> Result<(), String> {
+    let models = caps_cache()
+        .read()
+        .map_err(|_| "模型能力缓存锁已损坏".to_string())?
+        .clone();
+    let saved = PersistedModelCaps {
+        updated_at_ms: now_ms(),
+        models,
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    }
+    let content = serde_json::to_vec_pretty(&saved).map_err(|e| format!("序列化缓存失败: {e}"))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, content).map_err(|e| format!("写入缓存失败: {e}"))?;
+    std::fs::rename(&temporary, path).map_err(|e| format!("替换缓存失败: {e}"))
 }
 use crate::provider::Provider;
 

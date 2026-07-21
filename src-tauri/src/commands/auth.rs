@@ -399,11 +399,11 @@ pub async fn auth_kiro_social_login(
         })
         .await?;
     let default_account_id = auth_manager.default_account_id().await;
-    Ok(map_account(
-        AUTH_PROVIDER_KIRO,
-        account,
-        default_account_id.as_deref(),
-    ))
+    let account_id = account.id.clone();
+    let mapped = map_account(AUTH_PROVIDER_KIRO, account, default_account_id.as_deref());
+    drop(auth_manager);
+    crate::commands::prewarm_kiro_models(kiro_state.0.clone(), Some(account_id));
+    Ok(mapped)
 }
 
 /// 使用 KIRO_API_KEY（ksk_ 格式）登录 Kiro。
@@ -415,11 +415,11 @@ pub async fn auth_kiro_api_key_login(
     let auth_manager = kiro_state.0.read().await;
     let account = auth_manager.apikey_login(&api_key).await?;
     let default_account_id = auth_manager.default_account_id().await;
-    Ok(map_account(
-        AUTH_PROVIDER_KIRO,
-        account,
-        default_account_id.as_deref(),
-    ))
+    let account_id = account.id.clone();
+    let mapped = map_account(AUTH_PROVIDER_KIRO, account, default_account_id.as_deref());
+    drop(auth_manager);
+    crate::commands::prewarm_kiro_models(kiro_state.0.clone(), Some(account_id));
+    Ok(mapped)
 }
 
 /// Kiro 主动导入本地 kiro-cli / kiro-ide 凭证（仅在用户点击按钮时读取）。
