@@ -832,7 +832,7 @@ export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
       ...brandedRoutes(
         "claude-sonnet-5",
         "claude-opus-5",
-        "claude-haiku-4-5",
+        "claude-haiku-4.5",
       ),
       {
         routeId: "claude-fable-5",
